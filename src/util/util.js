@@ -331,7 +331,7 @@ module.exports = {
         modifyFields.push((function(fieldPath) {
           return function(sub) {
             var data = _.get(sub, fieldPath);
-            _.set(sub, fieldPath, (!data || data === 'data:,') ? 'NO' : 'YES');
+            _.set(sub, fieldPath, (!data || (data.length < 25)) ? '' : 'YES');
           };
         })(path));
       }
