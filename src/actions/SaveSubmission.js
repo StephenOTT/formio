@@ -47,10 +47,10 @@ module.exports = function(router) {
     next(null, [
       {
         type: 'resourcefields',
-        key: 'settings[resource]',
+        key: 'resource',
         title: 'Save submission to',
         placeholder: 'This form',
-        basePath: hook.alter('url', '/form', req),
+        basePath: hook.alter('path', '/form', req),
         form: req.params.formId,
         required: false
       }
@@ -94,6 +94,9 @@ module.exports = function(router) {
       // and parameters to make it seem like a separate request to update
       // the child submissions.
       var childReq = util.createSubRequest(req);
+      if (!childReq) {
+        return done('Too many recursive requests.');
+      }
       childReq.noResponse = true;
       childReq.body = body;
       childReq.formId = childReq.params.formId = resource._id.toString();
@@ -171,6 +174,7 @@ module.exports = function(router) {
         req.body.externalIds = req.body.externalIds || [];
         req.body.externalIds.push({
           type: 'resource',
+          resource: this.settings.resource,
           id: res.resource.item._id.toString()
         });
       }
@@ -229,7 +233,7 @@ module.exports = function(router) {
           }
 
           // Find the external submission.
-          var external = _.find(currentSubmission.externalIds, {type: 'resource'});
+          var external = _.find(currentSubmission.externalIds, {type: 'resource', resource: this.settings.resource});
           if (!external) {
             return then();
           }

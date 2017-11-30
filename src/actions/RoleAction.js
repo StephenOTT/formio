@@ -1,7 +1,6 @@
 'use strict';
 
 var _ = require('lodash');
-var mongoose = require('mongoose');
 var debug = {
   loadUser: require('debug')('formio:action:role#loadUser'),
   addRole: require('debug')('formio:action:role#addRole'),
@@ -13,6 +12,7 @@ var debug = {
 module.exports = function(router) {
   var Action = router.formio.Action;
   var hook = require('../util/hook')(router.formio);
+  var util = router.formio.util;
 
   /**
    * RoleAction class.
@@ -56,7 +56,7 @@ module.exports = function(router) {
             type: 'select',
             input: true,
             label: 'Resource Association',
-            key: 'settings[association]',
+            key: 'association',
             placeholder: 'Select the type of resource to perform role manipulation.',
             template: '<span>{{ item.title }}</span>',
             dataSrc: 'json',
@@ -82,7 +82,7 @@ module.exports = function(router) {
             type: 'select',
             input: true,
             label: 'Action Type',
-            key: 'settings[type]',
+            key: 'type',
             placeholder: 'Select whether this Action will Add or Remove the contained Role.',
             template: '<span>{{ item.title }}</span>',
             dataSrc: 'json',
@@ -108,7 +108,7 @@ module.exports = function(router) {
             type: 'select',
             input: true,
             label: 'Role',
-            key: 'settings[role]',
+            key: 'role',
             placeholder: 'Select the Role that this action will Add or Remove.',
             template: '<span>{{ item.title }}</span>',
             dataSrc: 'json',
@@ -140,11 +140,11 @@ module.exports = function(router) {
   RoleAction.prototype.resolve = function(handler, method, req, res, next) {
     // Check the submission for the submissionId.
     if (this.settings.association !== 'existing' && this.settings.association !== 'new') {
-      return next('Invalid setting `association` for the RoleAction; expecting `new` or `existing`.');
+      return res.status(400).send('Invalid setting `association` for the RoleAction; expecting `new` or `existing`.');
     }
     // Error if operation type is not valid.
     if (!this.settings.type || (this.settings.type !== 'add' && this.settings.type !== 'remove')) {
-      return next('Invalid setting `type` for the RoleAction; expecting `add` or `remove`.');
+      return res.status(400).send('Invalid setting `type` for the RoleAction; expecting `add` or `remove`.');
     }
     // Error if no resource is being returned.
     if (
@@ -152,17 +152,17 @@ module.exports = function(router) {
       res.hasOwnProperty('resource') &&
       !res.resource.item && this.settings.role
     ) {
-      return next('Invalid resource was provided for RoleAction association of `new`.');
+      return res.status(400).send('Invalid resource was provided for RoleAction association of `new`.');
     }
     // Error if association is existing and valid data was not provided.
     if (this.settings.association === 'existing' && !(this.settings.role || req.submission.data.role)) {
-      return next(
+      return res.status(400).send(
         'Missing role for RoleAction association of `existing`. Must specify role to assign in action settings or a ' +
         'form component named `role`'
       );
     }
-    if (this.settings.association === 'existing' && !req.submission.data.submission) {
-      return next(
+    if (this.settings.association === 'existing' && !(req.submission.data.submission || res.resource.item)) {
+      return res.status(400).send(
         'Missing submission for RoleAction association of `existing`. Form must have a resource field named ' +
         '`submission`.'
       );
@@ -180,12 +180,13 @@ module.exports = function(router) {
       debug.loadUser(submission);
       router.formio.resources.submission.model.findById(submission, function(err, user) {
         if (err) {
-          return next(err);
+          return res.status(400).send(err.message || err);
         }
         if (!user) {
-          return next('No Submission was found with the given setting `submission`.');
+          return res.status(400).send('No Submission was found with the given setting `submission`.');
         }
 
+        debug.loadUser(user);
         return callback(user);
       });
     };
@@ -194,7 +195,7 @@ module.exports = function(router) {
     var resource = {};
     var role = {};
     if (this.settings.association === 'existing') {
-      resource = req.submission.data.submission;
+      resource = req.submission.data.submission || res.resource.item;
       role = this.settings.role
         ? this.settings.role
         : req.submission.data.role;
@@ -238,9 +239,9 @@ module.exports = function(router) {
 
       // The given role already exists in the resource.
       var compare = [];
-      submission.roles.forEach(function(element) {
+      _.each(_.get(submission, 'roles'), function(element) {
         if (element) {
-          compare.push(element.toString());
+          compare.push(util.idToString(element));
         }
       });
 
@@ -252,9 +253,7 @@ module.exports = function(router) {
       // Add and save the role to the submission.
       compare.push(role);
       compare = _.uniq(compare);
-      compare = _.map(compare, function(rid) {
-        return mongoose.Types.ObjectId(rid);
-      });
+      compare.map(util.idToBson);
       submission.roles = compare;
 
       // Update the submission model.
@@ -278,7 +277,7 @@ module.exports = function(router) {
       var compare = [];
       submission.roles.forEach(function(element) {
         if (element) {
-          compare.push(element.toString());
+          compare.push(util.idToString(element));
         }
       });
 
@@ -289,9 +288,7 @@ module.exports = function(router) {
 
       // Remove this role from the mongoose model and save.
       compare = _.uniq(_.pull(compare, role));
-      compare = _.map(compare, function(rid) {
-        return mongoose.Types.ObjectId(rid);
-      });
+      compare.map(util.idToBson);
       submission.roles = compare;
 
       // Update the submission model.
@@ -325,6 +322,13 @@ module.exports = function(router) {
         }
       });
     };
+
+    /**
+     * Prepare to load existing resource
+     */
+    if (typeof resource === 'object' && resource.hasOwnProperty('_id')) {
+      resource = resource._id;
+    }
 
     /**
      * Resolve the action.

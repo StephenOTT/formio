@@ -1,6 +1,8 @@
 'use strict';
 
-module.exports = {
-  default: require('./default.json'),
-  empty: require('./empty.json')
+module.exports = (router) => {
+  return {
+    import: require('./import')(router),
+    export: require('./export')(router)
+  };
 };

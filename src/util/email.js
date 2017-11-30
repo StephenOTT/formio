@@ -1,303 +1,484 @@
 'use strict';
 
-var nodemailer = require('nodemailer');
-var sgTransport = require('nodemailer-sendgrid-transport');
-var mandrillTransport = require('nodemailer-mandrill-transport');
-var mailgunTransport = require('nodemailer-mailgun-transport');
-var nunjucks = require('./nunjucks');
-var debug = require('debug')('formio:settings:email');
-var rest = require('restler');
-var _ = require('lodash');
+let nodemailer = require('nodemailer');
+let sgTransport = require('nodemailer-sendgrid-transport');
+let mandrillTransport = require('nodemailer-mandrill-transport');
+let mailgunTransport = require('nodemailer-mailgun-transport');
+let debug = {
+  email: require('debug')('formio:settings:email'),
+  send: require('debug')('formio:settings:send'),
+  error: require('debug')('formio:error'),
+  nunjucksInjector: require('debug')('formio:email:nunjucksInjector')
+};
+let rest = require('restler');
+let util = require('./util');
+let _ = require('lodash');
+let EMAIL_OVERRIDE = process.env.EMAIL_OVERRIDE;
+let Thread = require('../worker/Thread');
 
 /**
  * The email sender for emails.
  * @param formio
  * @returns {{send: Function}}
  */
-module.exports = function(formio) {
-  var hook = require('./hook')(formio);
-  return {
-    availableTransports: function(req, next) {
-      hook.settings(req, function(err, settings) {
-        if (err) {
-          debug(err);
-          return next(err);
-        }
+module.exports = (formio) => {
+  let hook = require('./hook')(formio);
 
-        // Build the list of available transports, based on the present project settings.
-        var availableTransports = [{
-          transport: 'default',
-          title: 'Default (charges may apply)'
-        }];
-        if (_.get(settings, 'email.custom.url')) {
-          availableTransports.push({
-            transport: 'custom',
-            title: 'Custom'
-          });
+  /**
+   * Get the list of available email transports.
+   *
+   * @param req
+   * @param next
+   */
+  let availableTransports = (req, next) => {
+    hook.settings(req, (err, settings) => {
+      if (err) {
+        debug.email(err);
+        return next(err);
+      }
+
+      // Build the list of available transports, based on the present project settings.
+      let availableTransports = [{
+        transport: 'default',
+        title: 'Default (charges may apply)'
+      }];
+      if (_.get(settings, 'email.custom.url')) {
+        availableTransports.push({
+          transport: 'custom',
+          title: 'Custom'
+        });
+      }
+      if (_.get(settings, 'email.gmail.auth.user') && _.get(settings, 'email.gmail.auth.pass')) {
+        availableTransports.push({
+          transport: 'gmail',
+          title: 'G-Mail'
+        });
+      }
+      if (
+        (_.get(settings, 'email.sendgrid.auth.api_user') && _.get(settings, 'email.sendgrid.auth.api_key'))
+        || ((!_.get(settings, 'email.sendgrid.auth.api_user') && _.get(settings, 'email.sendgrid.auth.api_key')))
+      ) {
+        // Omit the username if user has configured sendgrid for api key access.
+        if (_.get(settings, 'email.sendgrid.auth.api_user') === 'apikey') {
+          settings.email.sendgrid.auth = _.omit(settings.email.sendgrid.auth, 'api_user');
         }
-        if (_.get(settings, 'email.gmail.auth.user') && _.get(settings, 'email.gmail.auth.pass')) {
-          availableTransports.push({
-            transport: 'gmail',
-            title: 'G-Mail'
-          });
-        }
-        if (
-          (_.get(settings, 'email.sendgrid.auth.api_user') && _.get(settings, 'email.sendgrid.auth.api_key'))
-          || ((!_.get(settings, 'email.sendgrid.auth.api_user') && _.get(settings, 'email.sendgrid.auth.api_key')))
-        ) {
-          // Omit the username if user has configured sendgrid for api key access.
-          if (_.get(settings, 'email.sendgrid.auth.api_user') === 'apikey') {
-            settings.email.sendgrid.auth = _.omit(settings.email.sendgrid.auth, 'api_user');
+        availableTransports.push({
+          transport: 'sendgrid',
+          title: 'SendGrid'
+        });
+      }
+      if (_.get(settings, 'email.mandrill.auth.apiKey')) {
+        availableTransports.push({
+          transport: 'mandrill',
+          title: 'Mandrill'
+        });
+      }
+      if (_.get(settings, 'email.mailgun.auth.api_key')) {
+        availableTransports.push({
+          transport: 'mailgun',
+          title: 'Mailgun'
+        });
+      }
+      if (_.get(settings, 'email.smtp.host')
+        && _.get(settings, 'email.smtp.auth.user')
+        && _.get(settings, 'email.smtp.auth.pass')
+      ) {
+        availableTransports.push({
+          transport: 'smtp',
+          title: 'SMTP'
+        });
+      }
+
+      availableTransports = hook.alter('emailTransports', availableTransports, settings);
+      next(null, availableTransports);
+    });
+  };
+
+  /**
+   * Get a simple email object.
+   *
+   * @param transport
+   * @param from
+   * @param emails
+   * @param subject
+   * @param message
+   *
+   * @returns {{transport: *, from: *, emails: *, subject: *, message: *}}
+   */
+  let settings = (transport, from, emails, subject, message) => {
+    return {
+      transport,
+      from,
+      emails,
+      subject,
+      message
+    };
+  };
+
+  /**
+   * Get the available substitution parameters for the current email context.
+   *
+   * @param res
+   * @param form
+   * @param submission
+   *
+   * @returns {Promise}
+   *   The available substitution values.
+   */
+  let getParams = (res, form, submission) => new Promise((resolve, reject) => {
+    let params = _.cloneDeep(submission);
+    if (res && res.resource && res.resource.item) {
+      if (typeof res.resource.item.toObject === 'function') {
+        params = _.assign(params, res.resource.item.toObject());
+      }
+      else {
+        params = _.assign(params, res.resource.item);
+      }
+      params.id = params._id.toString();
+    }
+
+    // The form components.
+    params.components = {};
+
+    let replacements = [];
+
+    // Flatten the resource data.
+    util.eachComponent(form.components, (component) => {
+      params.components[component.key] = component;
+      if (component.type === 'resource' && params.data[component.key]) {
+        params.data[component.key + 'Obj'] = params.data[component.key];
+
+        let thread = new Thread(Thread.Tasks.nunjucks).start({
+          template: component.template,
+          context: {
+            item: params.data[component.key]
           }
-          availableTransports.push({
-            transport: 'sendgrid',
-            title: 'SendGrid'
-          });
-        }
-        if (_.get(settings, 'email.mandrill.auth.apiKey')) {
-          availableTransports.push({
-            transport: 'mandrill',
-            title: 'Mandrill'
-          });
-        }
-        if (_.get(settings, 'email.mailgun.auth.api_key')) {
-          availableTransports.push({
-            transport: 'mailgun',
-            title: 'Mailgun'
-          });
-        }
-        if (_.get(settings, 'email.smtp.host')
-          && _.get(settings, 'email.smtp.auth.user')
-          && _.get(settings, 'email.smtp.auth.pass')
-        ) {
-          availableTransports.push({
-            transport: 'smtp',
-            title: 'SMTP'
-          });
-        }
+        })
+        .then(response => {
+          params.data[component.key] = response.output;
+          return response;
+        });
 
-        availableTransports = hook.alter('emailTransports', availableTransports, settings);
-        next(null, availableTransports);
-      });
-    },
-    settings: function(transport, from, emails, subject, message) {
-      return {
-        transport: transport,
-        from: from,
-        emails: emails,
-        subject: subject,
-        message: message
-      };
-    },
-    send: function(req, res, message, params, next) {
-      // The transporter object.
-      var transporter = {sendMail: null};
+        replacements.push(thread);
+      }
+    });
 
-      // Add the request params.
-      params.req = {
-        user: req.user,
-        token: req.token,
-        params: req.params,
-        query: req.query
-      };
+    Promise.all(replacements).then(results => {
+      // Get the parameters for the email.
+      params.form = form;
+      return resolve(params);
+    })
+    .catch(reject);
+  });
 
-      // Add the response parameters.
-      params.res = {
-        token: res.token
-      };
+  /**
+   * Util function to run the email through nunjucks.
+   *
+   * @param mail
+   * @param options
+   *
+   * @return {Promise}
+   */
+  let nunjucksInjector = (mail, options) => new Promise((resolve, reject) => {
+    if (!mail || !mail.to) {
+      return reject(`No mail was given to send.`);
+    }
 
-      var emailType = message.transport ? message.transport : 'default';
+    let params = options.params;
 
-      // To send the mail.
-      var sendMail = function(mail, sendEach, noCompile) {
-        // Allow the nunjucks templates to be reflective.
-        params.mail = mail;
+    // Replace all newline chars with empty strings, to fix newline support in html emails.
+    if (mail.html && (typeof mail.html === 'string')) {
+      mail.html = mail.html.replace(/\n/g, '');
+    }
+    debug.nunjucksInjector(mail);
 
-        // Compile the email with nunjucks.
-        if (!noCompile) {
-          try {
-            mail = nunjucks.renderObj(mail, params);
+    // Allow the nunjucks templates to be reflective.
+    params.mail = mail;
+
+    // Compile the email with nunjucks in a separate thread.
+    return new Thread(Thread.Tasks.nunjucks)
+    .start({
+      render: mail,
+      context: params
+    })
+    .then(injectedEmail => {
+      debug.nunjucksInjector(injectedEmail);
+      if (!injectedEmail) {
+        return reject(`An error occurred while processing the Email.`);
+      }
+
+      return resolve(injectedEmail);
+    });
+  });
+
+  /**
+   * Send an email using the current context data.
+   *
+   * @param req
+   * @param res
+   * @param message
+   * @param params
+   * @param next
+   * @returns {*}
+   */
+  let send = (req, res, message, params, next) => {
+    // The transporter object.
+    let transporter = {sendMail: null};
+
+    // Add the request params.
+    params.req = {
+      user: req.user,
+      token: req.token,
+      params: req.params,
+      query: req.query
+    };
+
+    // Add the response parameters.
+    params.res = {
+      token: res.token
+    };
+
+    // Get the transport for this context.
+    let emailType = message.transport
+      ? message.transport
+      : 'default';
+
+    let _config = (formio && formio.config && formio.config.email && formio.config.email.type);
+    debug.send(message);
+    debug.send(emailType);
+
+    // Get the settings.
+    hook.settings(req, (err, settings) => { // eslint-disable-line max-statements
+      if (err) {
+        debug.send(err);
+        return next(err);
+      }
+
+      // Force the email type to custom for EMAIL_OVERRIDE which will allow
+      // us to use ngrok to test emails out of test platform.
+      if (EMAIL_OVERRIDE) {
+        try {
+          let override = JSON.parse(EMAIL_OVERRIDE);
+          if (override && override.hasOwnProperty('transport')) {
+            emailType = override.transport;
+            settings.email = {};
+            settings.email[emailType] = override.settings;
           }
-          catch (e) {
-            mail = null;
+          else {
+            emailType = 'custom';
           }
         }
-
-        if (!mail || !mail.to) {
-          return;
+        catch (err) {
+          emailType = 'custom';
         }
+      }
 
-        if (mail.html && (typeof mail.html === 'string')) {
-          mail.html = mail.html.replace(/\n/g, '');
-        }
-
-        if (sendEach) {
-          var emails = _.uniq(_.map(mail.to.split(','), _.trim));
-          (function sendNext() {
-            sendMail(_.assign({}, mail, {
-              to: emails.shift()
-            }), false, true);
-            if (emails.length > 0) {
-              process.nextTick(sendNext);
-            }
-          })();
-        }
-        else if (transporter && (typeof transporter.sendMail === 'function')) {
-          // Allow others to alter the email before it is sent.
-          hook.alter('email', mail, req, res, params, function(err, mail) {
-            if (err) {
-              return;
-            }
-
-            // Override the "to" email if provided on a test server.
-            if (process.env.EMAIL_OVERRIDE) {
-              mail.to = process.env.EMAIL_OVERRIDE;
-            }
-
-            // Send the email.
-            transporter.sendMail(mail);
-          });
-        }
-      };
-
-      // Get the settings.
-      hook.settings(req, function(err, settings) { // eslint-disable-line max-statements
-        if (err) {
-          debug(err);
-          return;
-        }
-
-        var _config = (formio && formio.config && formio.config.email && formio.config.email.type);
-
-        debug(formio.config);
-        debug(emailType);
-        switch (emailType) {
-          case 'default':
-            if (_config && formio.config.email.type === 'sendgrid') {
-              /* eslint-disable camelcase */
-              // Check if the user has configured sendgrid for api key access.
-              if (!formio.config.email.username && formio.config.email.password) {
-                transporter = nodemailer.createTransport(sgTransport({
-                  auth: {
-                    api_key: formio.config.email.password
-                  }
-                }));
-              }
-              else {
-                transporter = nodemailer.createTransport(sgTransport({
-                  auth: {
-                    api_user: formio.config.email.username,
-                    api_key: formio.config.email.password
-                  }
-                }));
-              }
-              /* eslint-enable camelcase */
-            }
-            else if (_config && formio.config.email.type === 'mandrill') {
-              transporter = nodemailer.createTransport(mandrillTransport({
+      switch (emailType) {
+        case 'default':
+          if (_config && formio.config.email.type === 'sendgrid') {
+            /* eslint-disable camelcase */
+            // Check if the user has configured sendgrid for api key access.
+            if (!formio.config.email.username && formio.config.email.password) {
+              transporter = nodemailer.createTransport(sgTransport({
                 auth: {
-                  apiKey: formio.config.email.apiKey
+                  api_key: formio.config.email.password
                 }
               }));
             }
-            break;
-          case 'sendgrid':
-            debug(settings.email.sendgrid);
-            if (settings.email.sendgrid) {
-              // Check if the user has configured sendgrid for api key access.
-              if (_.get(settings, 'email.sendgrid.auth.api_user')
-                && _.get(settings, 'email.sendgrid.auth.api_user').toString() === 'apikey'
-              ) {
-                settings.email.sendgrid.auth = _.omit(settings.email.sendgrid.auth, 'api_user');
+            else {
+              transporter = nodemailer.createTransport(sgTransport({
+                auth: {
+                  api_user: formio.config.email.username,
+                  api_key: formio.config.email.password
+                }
+              }));
+            }
+            /* eslint-enable camelcase */
+          }
+          else if (_config && formio.config.email.type === 'mandrill') {
+            transporter = nodemailer.createTransport(mandrillTransport({
+              auth: {
+                apiKey: formio.config.email.apiKey
               }
+            }));
+          }
+          break;
+        case 'sendgrid':
+          if (_.has(settings, 'email.sendgrid')) {
+            debug.email(settings.email.sendgrid);
+            // Check if the user has configured sendgrid for api key access.
+            if (_.get(settings, 'email.sendgrid.auth.api_user')
+              && _.get(settings, 'email.sendgrid.auth.api_user').toString() === 'apikey'
+            ) {
+              settings.email.sendgrid.auth = _.omit(settings.email.sendgrid.auth, 'api_user');
+            }
 
-              debug(settings.email.sendgrid);
-              transporter = nodemailer.createTransport(sgTransport(settings.email.sendgrid));
+            debug.email(settings.email.sendgrid);
+            transporter = nodemailer.createTransport(sgTransport(settings.email.sendgrid));
+          }
+          break;
+        case 'mandrill':
+          if (_.has(settings, 'email.mandrill')) {
+            transporter = nodemailer.createTransport(mandrillTransport(settings.email.mandrill));
+          }
+          break;
+        case 'mailgun':
+          if (_.has(settings, 'email.mailgun')) {
+            transporter = nodemailer.createTransport(mailgunTransport(settings.email.mailgun));
+          }
+          break;
+        case 'smtp':
+          if (_.has(settings, 'email.smtp')) {
+            let _settings = {
+              debug: true
+            };
+
+            if (_.has(settings, 'email.smtp.port')) {
+              _settings['port'] = parseInt(_.get(settings, 'email.smtp.port'));
             }
-            break;
-          case 'mandrill':
-            if (settings.email.mandrill) {
-              transporter = nodemailer.createTransport(mandrillTransport(settings.email.mandrill));
-            }
-            break;
-          case 'mailgun':
-            if (settings.email.mailgun) {
-              transporter = nodemailer.createTransport(mailgunTransport(settings.email.mailgun));
-            }
-            break;
-          case 'smtp':
-            if (_.has(settings, 'email.smtp')) {
-              var _settings = {
-                debug: true
+            if (_.has(settings, 'email.smtp.secure')) {
+              let boolean = {
+                'true': true,
+                'false': false
               };
 
-              if (_.has(settings, 'email.smtp.port')) {
-                _settings['port'] = parseInt(_.get(settings, 'email.smtp.port'));
-              }
-              if (_.has(settings, 'email.smtp.secure')) {
-                var boolean = {
-                  'true': true,
-                  'false': false
-                };
-
-                _settings['secure'] = _.get(boolean, _.get(settings, 'email.smtp.secure')) || false;
-              }
-              if (_.has(settings, 'email.smtp.host')) {
-                _settings['host'] = _.get(settings, 'email.smtp.host');
-              }
-              if (_.has(settings, 'email.smtp.auth')) {
-                _settings['auth'] = {
-                  user: _.get(settings, 'email.smtp.auth.user'),
-                  pass: _.get(settings, 'email.smtp.auth.pass')
-                };
-              }
-
-              transporter = nodemailer.createTransport(_settings);
+              _settings['secure'] = _.get(boolean, _.get(settings, 'email.smtp.secure')) || false;
             }
-            break;
-          case 'custom':
-            if (settings.email.custom) {
-              transporter.sendMail = function(mail) {
-                var options = {};
-                if (settings.email.custom.username) {
-                  options.username = settings.email.custom.username;
-                  options.password = settings.email.custom.password;
+            if (_.has(settings, 'email.smtp.host')) {
+              _settings['host'] = _.get(settings, 'email.smtp.host');
+            }
+            if (_.has(settings, 'email.smtp.auth')) {
+              _settings['auth'] = {
+                user: _.get(settings, 'email.smtp.auth.user'),
+                pass: _.get(settings, 'email.smtp.auth.pass')
+              };
+            }
+
+            transporter = nodemailer.createTransport(_settings);
+          }
+          break;
+        case 'custom':
+          if (_.has(settings, 'email.custom')) {
+            transporter.sendMail = (mail, cb) => {
+              let options = {};
+              if (settings.email.custom.username) {
+                options.username = settings.email.custom.username;
+                options.password = settings.email.custom.password;
+              }
+
+              rest.postJson(settings.email.custom.url, mail, options)
+              .on('complete', (result, response) => {
+                if (result instanceof Error) {
+                  return cb(result);
                 }
 
-                rest.postJson(settings.email.custom.url, mail, options);
-              };
-            }
-            break;
-          case 'gmail':
-            if (settings.email.gmail) {
-              var options = settings.email.gmail;
-              options.service = 'Gmail';
-              transporter = nodemailer.createTransport(options);
-            }
-            break;
-          case 'test':
-            transporter.sendMail = function(mail) {
-              hook.invoke('email', emailType, mail);
+                return cb(null, result);
+              });
             };
-            break;
-          default:
-            transporter = hook.invoke('email', emailType, message, settings, req, res, params);
-            break;
+          }
+          break;
+        case 'gmail':
+          if (_.has(settings, 'email.gmail')) {
+            let options = settings.email.gmail;
+            options.service = 'Gmail';
+            transporter = nodemailer.createTransport(options);
+          }
+          break;
+        case 'test':
+        default:
+          transporter.sendMail = (mail, cb) => {
+            return cb(null, mail);
+          };
+          break;
+      }
+
+      // If we don't have a valid transport, don't waste time with nunjucks.
+      if (!transporter || typeof transporter.sendMail !== 'function') {
+        debug.error(`Could not determine which email transport to use for ${emailType}`);
+        return next();
+      }
+
+      let mail = {
+        from: message.from ? message.from : 'no-reply@form.io',
+        to: (typeof message.emails === 'string') ? message.emails : message.emails.join(', '),
+        subject: message.subject,
+        html: message.message
+      };
+      let options = {
+        params
+      };
+
+      nunjucksInjector(mail, options)
+      .then(email => {
+        let queue = [];
+        let emails = [];
+
+        debug.send(`message.sendEach: ${message.sendEach}`);
+        debug.send(`email: ${JSON.stringify(email)}`);
+        if (message.sendEach === true) {
+          let addresses = _.uniq(_.map(email.to.split(','), _.trim));
+          debug.send(`addresses: ${JSON.stringify(addresses)}`);
+          addresses.forEach(address => {
+            // Make a copy of the email for each recipient.
+            emails.push(_.assign({}, email, {to: address}));
+          });
+        }
+        else {
+          emails.push(email);
         }
 
-        // Ensure we have a valid transporter to send the email.
-        if (transporter && (typeof transporter.sendMail === 'function')) {
-          sendMail({
-            from: message.from ? message.from : 'no-reply@form.io',
-            to: (typeof message.emails === 'string') ? message.emails : message.emails.join(', '),
-            subject: message.subject,
-            html: message.message
-          }, message.sendEach);
-        }
-      }.bind(this));
+        debug.send(`emails: ${JSON.stringify(emails)}`);
+        // Send each mail using the transporter.
+        emails.forEach(email => {
+          // Replace all newline chars with empty strings, to fix newline support in html emails.
+          if (email.html && (typeof email.html === 'string')) {
+            email.html = email.html.replace(/\n/g, '');
+          }
 
-      // Move onto the next action immediately.
-      return next();
-    }
+          let pending = new Promise((resolve, reject) => {
+            // Allow anyone to hook the final email before sending.
+            return hook.alter('email', email, req, res, params, (err, email) => {
+              if (err) {
+                return reject(err);
+              }
+
+              // Allow anyone to hook the final destination settings before sending.
+              hook.alter('emailSend', true, email, (err, send) => {
+                if (err) {
+                  return reject(err);
+                }
+                if (!send) {
+                  return resolve(email);
+                }
+
+                return transporter.sendMail(email, (err, info) => {
+                  if (err) {
+                    return reject(err);
+                  }
+
+                  return resolve(info);
+                });
+              });
+            });
+          });
+
+          queue.push(pending);
+        });
+
+        return Promise.all(queue);
+      })
+      .then(response => next(null, response))
+      .catch(err => {
+        debug.error(err);
+        return next(err);
+      });
+    });
+  };
+
+  return {
+    availableTransports,
+    settings,
+    getParams,
+    send
   };
 };

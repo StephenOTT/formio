@@ -1,18 +1,17 @@
 'use strict';
 
-var mongoose = require('mongoose');
-var ObjectId = mongoose.Types.ObjectId;
-var _ = require('lodash');
 var debug = {
   form: require('debug')('formio:cache:form'),
   loadForm: require('debug')('formio:cache:loadForm'),
   loadFormByName: require('debug')('formio:cache:loadFormByName'),
   loadFormByAlias: require('debug')('formio:cache:loadFormByAlias'),
-  loadSubmission: require('debug')('formio:cache:loadSubmission')
+  loadSubmission: require('debug')('formio:cache:loadSubmission'),
+  error: require('debug')('formio:error')
 };
 
 module.exports = function(router) {
   var hook = require('../util/hook')(router.formio);
+  var util = router.formio.util;
 
   return {
     cache: function(req) {
@@ -69,12 +68,9 @@ module.exports = function(router) {
       }
 
       debug.loadForm(typeof id + ': ' + id);
-      try {
-        id = (typeof id === 'string') ? ObjectId(id) : id;
-      }
-      catch (e) {
-        debug.loadForm(e);
-        return cb('Invalid Form Id given.');
+      id = util.idToBson(id);
+      if (id === false) {
+        return cb('Invalid form _id given.');
       }
 
       var query = {_id: id, deleted: {$eq: null}};
@@ -82,36 +78,32 @@ module.exports = function(router) {
         query.type = type;
       }
 
-      router.formio.resources.form.model.findOne(query, function(err, result) {
-        if (err) {
-          debug.loadForm(err);
-          return cb(err);
-        }
-        if (!result) {
-          debug.loadForm('Resource not found for the query');
-          return cb('Resource not found');
-        }
+      router.formio.resources.form.model.findOne(
+        hook.alter('formQuery', query, req),
+        function(err, result) {
+          if (err) {
+            debug.loadForm(err);
+            return cb(err);
+          }
+          if (!result) {
+            debug.loadForm('Resource not found for the query');
+            return cb('Resource not found');
+          }
 
-        var componentMap = {};
-        result = result.toObject();
-        _.each(result.components, function(component) {
-          componentMap[component.key] = component;
-        });
-        result.componentMap = componentMap;
-        this.updateCache(req, cache, result);
-        debug.loadForm('Caching result');
-        cb(null, result);
-      }.bind(this));
+          var componentMap = {};
+          result = result.toObject();
+          util.eachComponent(result.components, function(component) {
+            componentMap[component.key] = component;
+          }, true);
+          result.componentMap = componentMap;
+          this.updateCache(req, cache, result);
+          debug.loadForm('Caching result');
+          cb(null, result);
+        }.bind(this)
+      );
     },
 
-    /**
-     * Loads the current form.
-     *
-     * @param req
-     * @param cb
-     * @returns {*}
-     */
-    loadCurrentForm: function(req, cb) {
+    getCurrentFormId: function(req) {
       var formId = req.formId;
       if (req.params.formId) {
         formId = req.params.formId;
@@ -123,9 +115,24 @@ module.exports = function(router) {
         formId = req.query.formId;
       }
       if (!formId) {
-        return cb('No form found.');
+        return '';
       }
       req.formId = formId;
+      return formId;
+    },
+
+    /**
+     * Loads the current form.
+     *
+     * @param req
+     * @param cb
+     * @returns {*}
+     */
+    loadCurrentForm: function(req, cb) {
+      let formId = this.getCurrentFormId(req);
+      if (!formId) {
+        return cb('No form found.');
+      }
       this.loadForm(req, null, formId, cb);
     },
 
@@ -148,23 +155,17 @@ module.exports = function(router) {
         return cb(null, cache.submissions[subId]);
       }
 
-      debug.loadSubmission('Searching for form: ' + formId.toString() + ', and submission: ' + subId.toString());
-      try {
-        formId = (typeof formId === 'string') ? ObjectId(formId) : formId;
-      }
-      catch (e) {
-        debug.loadSubmission(e);
-        return cb('Invalid Form Id given.');
+      subId = util.idToBson(subId);
+      if (subId === false) {
+        return cb('Invalid submission _id given.');
       }
 
-      try {
-        subId = (typeof subId === 'string') ? ObjectId(subId) : subId;
-      }
-      catch (e) {
-        debug.loadSubmission(e);
-        return cb('Invalid Submission Id given.');
+      formId = util.idToBson(formId);
+      if (formId === false) {
+        return cb('Invalid form _id given.');
       }
 
+      debug.loadSubmission('Searching for form: ' + formId + ', and submission: ' + subId);
       var query = {_id: subId, form: formId, deleted: {$eq: null}};
       debug.loadSubmission(query);
       router.formio.resources.submission.model.findOne(query)

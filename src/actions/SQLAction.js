@@ -72,7 +72,7 @@ module.exports = function(router) {
           type: 'select',
           input: true,
           label: 'SQL ServerType',
-          key: 'settings[type]',
+          key: 'type',
           placeholder: 'Select the SQL Server Type',
           template: '<span>{{ item.title }}</span>',
           dataSrc: 'json',
@@ -84,7 +84,7 @@ module.exports = function(router) {
         },
         {
           label: 'Query',
-          key: 'settings[query]',
+          key: 'query',
           placeholder: 'Enter the SQL query.',
           type: 'textarea',
           multiple: false,
@@ -100,8 +100,9 @@ module.exports = function(router) {
    * @param query
    * @returns {*}
    */
+  /* eslint-disable no-useless-escape */
   SQLAction.prototype.escape = function(query) {
-    return query.replace(/[\0\n\r\b\t\\\'\'\x1a]/g, function(s) {
+    return query.replace(/[\0\n\r\b\t\\\'\'\x1a]/g, function(s) { // eslint-disable-line no-control-regex
       switch (s) {
         case '\0': return '\\0';
         case '\n': return '\\n';
@@ -113,6 +114,7 @@ module.exports = function(router) {
       }
     });
   };
+  /* eslint-enable no-useless-escape */
 
   /**
    * Trigger the SQL action.
@@ -142,26 +144,28 @@ module.exports = function(router) {
         return !settings[prop];
       });
       if (missingSetting) {
-        return next(new Error('Database settings is missing `' + missingSetting + '`'));
+        return res.status(400).send('Database settings is missing `' + missingSetting + '`');
       }
 
       // Make sure they cannot connect to localhost.
       if (settings.host.search(/localhost|127\.0\.0\.1/) !== -1) {
-        return next(new Error('Invalid SQL Host'));
+        return res.status(400).send('Invalid SQL Host');
       }
 
       var method = req.method.toLowerCase();
+      var wait   = method === 'get' && this.settings.type === 'mssql';
 
       // Called when the submission is loaded.
       var onSubmission = function(submission) {
         if (!submission) {
+          wait = false;
           return;
         }
 
         // Create the query based on callbacks.
         var query = this.settings.query.replace(/{{\s+([^}]+)\s+}}/g, function() {
           var value = '';
-          var data = _.clone(submission);
+          var data = _.cloneDeep(submission);
 
           // Replace {{ id }} with the external ID.
           if (arguments[1] === 'id') {
@@ -190,7 +194,8 @@ module.exports = function(router) {
 
         // Make sure our query is still valid.
         if (!query) {
-          return next('Invalid Query');
+          wait = false;
+          return res.status(400).send('Invalid Query');
         }
 
         // Perform a post execution.
@@ -230,6 +235,9 @@ module.exports = function(router) {
 
           mssql.connect(config, function(err) {
             if (err) {
+              if (wait) {
+                return next();
+              }
               return;
             }
 
@@ -238,7 +246,14 @@ module.exports = function(router) {
               if ((method === 'post') && !err) {
                 postExecute.call(this, result[0]);
               }
+              if ((method === 'get' ) && !err && res && res.resource && res.resource.item) {
+                res.resource.item.metadata = res.resource.item.metadata || {};
+                res.resource.item.metadata[this.title] = result.toTable();
+              }
               mssql.close();
+              if (wait) {
+                return next();
+              }
             }.bind(this));
           }.bind(this));
         }
@@ -274,10 +289,13 @@ module.exports = function(router) {
           }
         });
       }
-    }.bind(this));
 
-    // Do not wait for the query to execute.
-    next();
+      // Do not wait for the query to execute except...
+      // Do wait on SQL Server get so we can return results
+      if (!wait) {
+        return next();
+      }
+    }.bind(this));
   };
 
   // Return the SQLAction.

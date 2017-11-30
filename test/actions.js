@@ -5,6 +5,9 @@ var request = require('supertest');
 var assert = require('assert');
 var _ = require('lodash');
 var chance = new (require('chance'))();
+var http = require('http');
+var url = require('url');
+var docker = process.env.DOCKER;
 
 module.exports = function(app, template, hook) {
   var Helper = require('./helper')(app);
@@ -350,8 +353,331 @@ module.exports = function(app, template, hook) {
       });
     });
 
+    describe('Action MachineNames', function() {
+      var _action;
+      var name = chance.word();
+      var helper;
+      
+      before(function() {
+        helper = new Helper(template.users.admin, template);
+      });
+
+      it('Actions expose their machineNames through the api', function(done) {
+        helper
+          .form({name: name})
+          .action({
+            title: 'Webhook',
+            name: 'webhook',
+            handler: ['after'],
+            method: ['create', 'update', 'delete'],
+            priority: 1,
+            settings: {
+              url: 'example.com',
+              username: '',
+              password: ''
+            }
+          })
+          .execute(function(err, result) {
+            if (err) {
+              return done(err);
+            }
+
+            var action = result.getAction('Webhook');
+            assert(action.hasOwnProperty('machineName'));
+            _action = action;
+            done();
+          });
+      });
+
+      it('A user can modify their action machineNames', function(done) {
+        var newMachineName = chance.word();
+
+        helper
+          .action(name, {
+            _id: _action._id,
+            machineName: newMachineName
+          })
+          .execute(function(err, result) {
+            if (err) {
+              return done(err);
+            }
+
+            var action = result.getAction('Webhook');
+            assert(action.hasOwnProperty('machineName'));
+            assert.equal(action.machineName, newMachineName);
+            done();
+          });
+      });
+    });
+
+    describe('Webhook Functionality tests', function() {
+      if (docker) {
+        return;
+      }
+
+      // The temp form with the add RoleAction for existing submissions.
+      var webhookForm = {
+        title: 'Webhook Form',
+        name: 'webhookform',
+        path: 'webhookform',
+        type: 'form',
+        access: [],
+        submissionAccess: [],
+        components: [
+          {
+            type: 'textfield',
+            validate: {
+              custom: '',
+              pattern: '',
+              maxLength: '',
+              minLength: '',
+              required: false
+            },
+            defaultValue: '',
+            multiple: false,
+            suffix: '',
+            prefix: '',
+            placeholder: 'foo',
+            key: 'firstName',
+            label: 'First Name',
+            inputMask: '',
+            inputType: 'text',
+            input: true
+          },
+          {
+            type: 'textfield',
+            validate: {
+              custom: '',
+              pattern: '',
+              maxLength: '',
+              minLength: '',
+              required: false
+            },
+            defaultValue: '',
+            multiple: false,
+            suffix: '',
+            prefix: '',
+            placeholder: 'foo',
+            key: 'lastName',
+            label: 'Last Name',
+            inputMask: '',
+            inputType: 'text',
+            input: true
+          },
+          {
+            type: 'email',
+            persistent: true,
+            unique: false,
+            protected: false,
+            defaultValue: '',
+            suffix: '',
+            prefix: '',
+            placeholder: 'Enter your email address',
+            key: 'email',
+            label: 'Email',
+            inputType: 'email',
+            tableView: true,
+            input: true
+          },
+          {
+            type: 'password',
+            persistent: true,
+            unique: false,
+            protected: false,
+            defaultValue: '',
+            suffix: '',
+            prefix: '',
+            placeholder: 'Enter your password',
+            key: 'password',
+            label: 'Password',
+            inputType: 'password',
+            tableView: true,
+            input: true
+          }
+        ]
+      };
+
+      var port = 4002;
+      var webhookSubmission = null;
+      var webhookHandler = function(body) {};
+
+      // Create a new server.
+      var newServer = function(ready) {
+        var server = http.createServer(function(request) {
+          var body = [];
+          request.on('data', function(chunk) {
+            body.push(chunk);
+          }).on('end', function() {
+            body = Buffer.concat(body).toString();
+            webhookHandler(body ? JSON.parse(body) : body, url.parse(request.url, true));
+          });
+        });
+        server.port = port++;
+        server.url = 'http://localhost:'+ server.port;
+        server.listen(server.port, function(err) {
+          hook.alter('webhookServer', server, app, template, function(err, server) {
+            ready(err, server);
+          });
+        });
+      };
+
+      it('Should create the form and action for the webhook tests', function(done) {
+        newServer(function(err, server) {
+          if (err) {
+            return done(err);
+          }
+          request(app)
+            .post(hook.alter('url', '/form', template))
+            .set('x-jwt-token', template.users.admin.token)
+            .send(webhookForm)
+            .expect('Content-Type', /json/)
+            .expect(201)
+            .end(function(err, res) {
+              if (err) {
+                return done(err);
+              }
+
+              webhookForm = res.body;
+              template.users.admin.token = res.headers['x-jwt-token'];
+              request(app)
+                .post(hook.alter('url', '/form/' + webhookForm._id + '/action', template))
+                .set('x-jwt-token', template.users.admin.token)
+                .send({
+                  title: 'Webhook',
+                  name: 'webhook',
+                  form: webhookForm._id.toString(),
+                  handler: ['after'],
+                  method: ['create', 'update', 'delete'],
+                  priority: 1,
+                  settings: {
+                    url: server.url,
+                    username: '',
+                    password: ''
+                  }
+                })
+                .expect('Content-Type', /json/)
+                .expect(201)
+                .end(function(err, res) {
+                  if (err) {
+                    return done(err);
+                  }
+                  template.users.admin.token = res.headers['x-jwt-token'];
+                  done();
+                });
+            });
+        });
+      });
+
+      it('Should send a webhook with create data.', function(done) {
+        webhookHandler = function(body) {
+          body = hook.alter('webhookBody', body);
+
+          assert.equal(body.params.formId, webhookForm._id.toString());
+          assert.equal(body.request.owner, template.users.admin._id.toString());
+          assert.equal(body.request.data.email, 'test@example.com');
+          assert.equal(body.request.data.firstName, 'Test');
+          assert.equal(body.request.data.lastName, 'Person');
+          assert(body.request.data.password !== '123testing', 'Passwords must not be visible via webhooks.');
+          assert.deepEqual(_.pick(body.submission, _.keys(webhookSubmission)), webhookSubmission);
+          done();
+        };
+        request(app)
+          .post(hook.alter('url', '/form/' + webhookForm._id + '/submission', template))
+          .set('x-jwt-token', template.users.admin.token)
+          .send({
+            data: {
+              firstName: 'Test',
+              lastName: 'Person',
+              email: 'test@example.com',
+              password: '123testing'
+            }
+          })
+          .expect(201)
+          .expect('Content-Type', /json/)
+          .end(function (err, res) {
+            if (err) {
+              return done(err);
+            }
+
+            webhookSubmission = res.body;
+          });
+      });
+
+      it('Should be able to get the data from the webhook action.', function(done) {
+        request(app)
+          .get(hook.alter('url', '/form/' + webhookForm._id + '/submission/' + webhookSubmission._id, template))
+          .set('x-jwt-token', template.users.admin.token)
+          .expect(200)
+          .expect('Content-Type', /json/)
+          .end(function (err, res) {
+            if (err) {
+              return done(err);
+            }
+
+            webhookSubmission = res.body;
+            assert.equal(res.body.data.email, 'test@example.com');
+            assert.equal(res.body.data.firstName, 'Test');
+            assert.equal(res.body.data.lastName, 'Person');
+            done();
+          });
+      });
+
+      it('Should send a webhook with update data.', function(done) {
+        webhookHandler = function(body) {
+          body = hook.alter('webhookBody', body);
+
+          assert.equal(body.params.formId, webhookForm._id.toString());
+          assert.equal(body.request.data.email, 'test@example.com');
+          assert.equal(body.request.data.firstName, 'Test2');
+          assert.equal(body.request.data.lastName, 'Person3');
+          assert.deepEqual(_.pick(body.submission, _.keys(webhookSubmission)), webhookSubmission);
+          done();
+        };
+        request(app)
+          .put(hook.alter('url', '/form/' + webhookForm._id + '/submission/' + webhookSubmission._id, template))
+          .set('x-jwt-token', template.users.admin.token)
+          .send({
+            data: {
+              firstName: 'Test2',
+              lastName: 'Person3',
+              email: 'test@example.com'
+            }
+          })
+          .expect(200)
+          .expect('Content-Type', /json/)
+          .end(function (err, res) {
+            if (err) {
+              return done(err);
+            }
+
+            webhookSubmission = res.body;
+          });
+      });
+
+      it('Should send a webhook with deleted data.', function(done) {
+        webhookHandler = function(body, url) {
+          body = hook.alter('webhookBody', body);
+
+          assert.equal(body, '');
+          assert.equal(url.query.formId, webhookForm._id);
+          assert.equal(url.query.submissionId, webhookSubmission._id);
+          done();
+        };
+        request(app)
+          .delete(hook.alter('url', '/form/' + webhookForm._id + '/submission/' + webhookSubmission._id, template))
+          .set('x-jwt-token', template.users.admin.token)
+          .expect(200)
+          .expect('Content-Type', /json/)
+          .end(function (err, res) {
+            if (err) {
+              return done(err);
+            }
+          });
+      });
+    });
+
     describe('EmailAction Functionality tests', function() {
-      if (process.env.DOCKER) {
+      if (docker) {
         return;
       }
 
@@ -493,8 +819,8 @@ module.exports = function(app, template, hook) {
           }
 
           // Check for an email.
-          template.hooks.onEmails(1, function(emails) {
-            var email = emails.shift();
+          let event = template.hooks.getEmitter();
+          event.once('newMail', (email) => {
             assert.equal(email.from, 'travis@form.io');
             assert.equal(email.to, 'test@example.com');
             assert.equal(email.html.indexOf('Howdy, '), 0);
@@ -534,8 +860,8 @@ module.exports = function(app, template, hook) {
           }
 
           // Check for an email.
-          template.hooks.onEmails(1, function(emails) {
-            var email = emails.shift();
+          let event = template.hooks.getEmitter();
+          event.once('newMail', (email) => {
             assert.equal(email.from, 'joe@example.com');
             assert.equal(email.to, 'joe@example.com, gary@form.io');
             assert.equal(email.html.indexOf('Howdy, '), 0);
@@ -575,18 +901,30 @@ module.exports = function(app, template, hook) {
             return done(err);
           }
 
-          template.hooks.onEmails(2, function(emails) {
-            assert.equal(emails.length, 2);
-            assert.equal(emails[0].from, 'travis@form.io');
-            assert.equal(emails[0].to, 'test@example.com');
-            assert.equal(emails[0].html.indexOf('Howdy, '), 0);
-            assert.equal(emails[0].subject, 'Hello there Test Person');
-            assert.equal(emails[1].from, 'travis@form.io');
-            assert.equal(emails[1].to, 'gary@form.io');
-            assert.equal(emails[1].html.indexOf('Howdy, '), 0);
-            assert.equal(emails[1].subject, 'Hello there Test Person');
-            done();
+          // Check for an email.
+          let event = template.hooks.getEmitter();
+          let email1 = new Promise((resolve, reject) => {
+            event.once('newMail', (email) => {
+              assert.equal(email.from, 'travis@form.io');
+              assert.equal(email.to, 'gary@form.io');
+              assert.equal(email.html.indexOf('Howdy, '), 0);
+              assert.equal(email.subject, 'Hello there Test Person');
+              resolve();
+            });
           });
+
+          let email2 = new Promise((resolve, reject) => {
+            event.once('newMail', (email) => {
+              assert.equal(email.from, 'travis@form.io');
+              assert.equal(email.to, 'test@example.com');
+              assert.equal(email.html.indexOf('Howdy, '), 0);
+              assert.equal(email.subject, 'Hello there Test Person');
+              resolve();
+            });
+          });
+          Promise.all([email1, email2])
+            .then(done)
+            .catch(done);
 
           request(app)
             .post(hook.alter('url', '/form/' + testForm._id + '/submission', template))
@@ -600,11 +938,7 @@ module.exports = function(app, template, hook) {
             })
             .expect(201)
             .expect('Content-Type', /json/)
-            .end(function (err, res) {
-              if (err) {
-                return done(err);
-              }
-            });
+            .end(done);
         });
       });
     });
@@ -1639,7 +1973,10 @@ module.exports = function(app, template, hook) {
             settings: {
               resources: [dummyResource._id.toString()],
               username: 'username',
-              password: 'password'
+              password: 'password',
+              allowedAttempts: 5,
+              attemptWindow: 10,
+              lockWait: 10
             }
           }
 
@@ -1764,10 +2101,10 @@ module.exports = function(app, template, hook) {
           });
       });
 
+      if (!docker)
       it('A deleted Action should remain in the database', function(done) {
-        if (!app.formio) return done();
-
-        app.formio.actions.model.findOne({_id: tempAction._id})
+        var formio = hook.alter('formio', app.formio);
+        formio.actions.model.findOne({_id: tempAction._id})
           .exec(function(err, action) {
             if (err) {
               return done(err);
@@ -1802,10 +2139,10 @@ module.exports = function(app, template, hook) {
           });
       });
 
+      if (!docker)
       it('A deleted Form should not have active actions in the database', function(done) {
-        if (!app.formio) return done();
-
-        app.formio.actions.model.find({form: tempForm._id, deleted: {$eq: null}})
+        var formio = hook.alter('formio', app.formio);
+        formio.actions.model.find({form: tempForm._id, deleted: {$eq: null}})
           .exec(function(err, action) {
             if (err) {
               return done(err);
@@ -1829,7 +2166,10 @@ module.exports = function(app, template, hook) {
           settings: {
             resources: [template.resources.user._id.toString()],
             username: 'username',
-            password: 'password'
+            password: 'password',
+            allowedAttempts: 5,
+            attemptWindow: 10,
+            lockWait: 10
           }
         };
 
@@ -1881,7 +2221,10 @@ module.exports = function(app, template, hook) {
           settings: {
             resources: [template.resources.user._id.toString()],
             username: 'username',
-            password: 'password'
+            password: 'password',
+            allowedAttempts: 5,
+            attemptWindow: 10,
+            lockWait: 10
           }
         };
 
@@ -1977,11 +2320,8 @@ module.exports = function(app, template, hook) {
 
     describe('Conditional Actions', function() {
       var helper = null;
-      if (process.env.DOCKER) {
-        return;
-      }
       it('Create the forms', function(done) {
-        var owner = app.hasProjects ? template.formio.owner : template.users.admin;
+        var owner = (app.hasProjects || docker) ? template.formio.owner : template.users.admin;
         helper = new Helper(owner);
         helper
           .project()
@@ -2084,6 +2424,7 @@ module.exports = function(app, template, hook) {
           })
           .execute(done);
       });
+
       it('Should conditionally execute the add role action.', function(done) {
         helper
           .submission({
@@ -2101,6 +2442,7 @@ module.exports = function(app, template, hook) {
             done();
           })
       });
+
       it('Should conditionally execute the add role action.', function(done) {
         helper
           .submission({
@@ -2118,6 +2460,7 @@ module.exports = function(app, template, hook) {
             done();
           })
       });
+
       it('Should conditionally execute the add role action.', function(done) {
         helper
           .submission({
@@ -2134,6 +2477,7 @@ module.exports = function(app, template, hook) {
             done();
           })
       });
+
       it('Should conditionally execute the add role action.', function(done) {
         helper
           .submission({
@@ -2150,6 +2494,7 @@ module.exports = function(app, template, hook) {
             done();
           })
       });
+
       it('Should execute ALL role actions.', function(done) {
         helper
           .submission({
@@ -2167,6 +2512,7 @@ module.exports = function(app, template, hook) {
             done();
           })
       });
+
       it('Should NOT execute any role actions.', function(done) {
         helper
           .submission({
@@ -2182,8 +2528,183 @@ module.exports = function(app, template, hook) {
             assert(submission.roles.indexOf(helper.template.roles.administrator._id) === -1);
             assert(submission.roles.indexOf(helper.template.roles.authenticated._id) === -1);
             done();
-          })
+          });
       });
+
+      it('Executes a does not equal action when not equal', function(done) {
+        var owner = (app.hasProjects || docker) ? template.formio.owner : template.users.admin;
+        helper = new Helper(owner);
+        helper
+          .project()
+          .resource([
+            {
+              type: 'email',
+              persistent: true,
+              unique: false,
+              protected: false,
+              defaultValue: '',
+              suffix: '',
+              prefix: '',
+              placeholder: 'Enter your email address',
+              key: 'email',
+              label: 'Email',
+              inputType: 'email',
+              tableView: true,
+              input: true
+            },
+            {
+              type: 'selectboxes',
+              label: 'Roles',
+              key: 'roles',
+              input: true,
+              values: [
+                {
+                  label: 'Administrator',
+                  value: 'administrator'
+                },
+                {
+                  label: 'Authenticated',
+                  value: 'authenticated'
+                }
+              ]
+            }
+          ])
+          .action({
+            title: 'Role Assignment',
+            name: 'role',
+            priority: 1,
+            handler: ['after'],
+            method: ['create'],
+            condition: {
+              field: 'email',
+              eq: 'notEqual',
+              value: 'none@example.com'
+            },
+            settings: {
+              association: 'new',
+              type: 'add',
+              role: 'authenticated'
+            }
+          })
+          .submission({
+            email: 'test@example.com'
+          })
+          .execute(function(err) {
+            if (err) {
+              return done(err);
+            }
+
+            var submission = helper.getLastSubmission();
+            assert(submission.roles.indexOf(helper.template.roles.administrator._id) === -1);
+            assert(submission.roles.indexOf(helper.template.roles.authenticated._id) !== -1);
+            done();
+          });
+      });
+
+      it('Does not execute a does not equal action when equal', function(done) {
+        helper
+          .submission({
+            email: 'none@example.com'
+          })
+          .execute(function(err) {
+            if (err) {
+              return done(err);
+            }
+
+            var submission = helper.getLastSubmission();
+            assert(submission.roles.indexOf(helper.template.roles.administrator._id) === -1);
+            assert(submission.roles.indexOf(helper.template.roles.authenticated._id) === -1);
+            done();
+          });
+      });
+
+      it('Executes a equal action when equal', function(done) {
+        var owner = (app.hasProjects || docker) ? template.formio.owner : template.users.admin;
+        helper = new Helper(owner);
+        helper
+          .project()
+          .resource([
+            {
+              type: 'email',
+              persistent: true,
+              unique: false,
+              protected: false,
+              defaultValue: '',
+              suffix: '',
+              prefix: '',
+              placeholder: 'Enter your email address',
+              key: 'email',
+              label: 'Email',
+              inputType: 'email',
+              tableView: true,
+              input: true
+            },
+            {
+              type: 'selectboxes',
+              label: 'Roles',
+              key: 'roles',
+              input: true,
+              values: [
+                {
+                  label: 'Administrator',
+                  value: 'administrator'
+                },
+                {
+                  label: 'Authenticated',
+                  value: 'authenticated'
+                }
+              ]
+            }
+          ])
+          .action({
+            title: 'Role Assignment',
+            name: 'role',
+            priority: 1,
+            handler: ['after'],
+            method: ['create'],
+            condition: {
+              field: 'email',
+              eq: 'equals',
+              value: 'test@example.com'
+            },
+            settings: {
+              association: 'new',
+              type: 'add',
+              role: 'authenticated'
+            }
+          })
+          .submission({
+            email: 'test@example.com'
+          })
+          .execute(function(err) {
+            if (err) {
+              return done(err);
+            }
+
+            var submission = helper.getLastSubmission();
+            assert(submission.roles.indexOf(helper.template.roles.administrator._id) === -1);
+            assert(submission.roles.indexOf(helper.template.roles.authenticated._id) !== -1);
+            done();
+          });
+      });
+
+      it('Does not execute a equal action when not equal', function(done) {
+        helper
+          .submission({
+            email: 'none@example.com'
+          })
+          .execute(function(err) {
+            if (err) {
+              return done(err);
+            }
+
+            var submission = helper.getLastSubmission();
+            assert(submission.roles.indexOf(helper.template.roles.administrator._id) === -1);
+            assert(submission.roles.indexOf(helper.template.roles.authenticated._id) === -1);
+            done();
+          });
+      });
+
     });
   });
 };

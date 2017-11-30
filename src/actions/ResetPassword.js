@@ -50,7 +50,7 @@ module.exports = function(router) {
         return next(err);
       }
 
-      var basePath = hook.alter('url', '/form', req);
+      var basePath = hook.alter('path', '/form', req);
       var dataSrc = basePath + '/' + req.params.formId + '/components';
 
       // Return the reset password information.
@@ -59,7 +59,7 @@ module.exports = function(router) {
           type: 'select',
           input: true,
           label: 'Resources',
-          key: 'settings[resources]',
+          key: 'resources',
           placeholder: 'Select the resources we should reset password against.',
           dataSrc: 'url',
           data: {url: basePath + '?type=resource'},
@@ -74,7 +74,7 @@ module.exports = function(router) {
           type: 'select',
           input: true,
           label: 'Username Field',
-          key: 'settings[username]',
+          key: 'username',
           placeholder: 'Select the username field',
           template: '<span>{{ item.label || item.key }}</span>',
           dataSrc: 'url',
@@ -89,7 +89,7 @@ module.exports = function(router) {
           type: 'select',
           input: true,
           label: 'Password Field',
-          key: 'settings[password]',
+          key: 'password',
           placeholder: 'Select the password field',
           template: '<span>{{ item.label || item.key }}</span>',
           dataSrc: 'url',
@@ -102,7 +102,7 @@ module.exports = function(router) {
         },
         {
           label: 'Reset Link URL',
-          key: 'settings[url]',
+          key: 'url',
           inputType: 'text',
           defaultValue: '',
           input: true,
@@ -115,7 +115,7 @@ module.exports = function(router) {
         },
         {
           label: 'Reset Password Button Label',
-          key: 'settings[label]',
+          key: 'label',
           inputType: 'text',
           defaultValue: 'Email Reset Password Link',
           input: true,
@@ -127,7 +127,7 @@ module.exports = function(router) {
           type: 'select',
           input: true,
           label: 'Transport',
-          key: 'settings[transport]',
+          key: 'transport',
           placeholder: 'Select the email transport.',
           template: '<span>{{ item.title }}</span>',
           defaultValue: 'default',
@@ -143,7 +143,7 @@ module.exports = function(router) {
         },
         {
           label: 'From:',
-          key: 'settings[from]',
+          key: 'from',
           inputType: 'email',
           defaultValue: 'no-reply@form.io',
           input: true,
@@ -155,7 +155,7 @@ module.exports = function(router) {
         },
         {
           label: 'Subject',
-          key: 'settings[subject]',
+          key: 'subject',
           inputType: 'text',
           defaultValue: 'You requested a password reset',
           input: true,
@@ -165,7 +165,7 @@ module.exports = function(router) {
         },
         {
           label: 'Message',
-          key: 'settings[message]',
+          key: 'message',
           type: 'textarea',
           defaultValue: '<p>Forgot your password? No problem.</p><p><a href="{{ resetlink }}">'
                         + 'Click here to reset your password</a></p> ',
@@ -200,8 +200,9 @@ module.exports = function(router) {
     var query = {
       deleted: {$eq: null}
     };
-    query[usernamekey] = token.username;
-    query.form = {$in: [_.map(token.resources, mongoose.Types.ObjectId)]};
+
+    query[usernamekey] = {$regex: new RegExp('^' + util.escapeRegExp(token.username) + '$'), $options: 'i'};
+    query.form = {$in: _.map(token.resources, mongoose.Types.ObjectId)};
 
     // Perform a mongo query to find the submission.
     router.formio.resources.submission.model.findOne(query, function(err, submission) {
@@ -262,14 +263,14 @@ module.exports = function(router) {
   };
 
   /**
-   * Initiialize the action.
+   * Initialize the action.
    */
   ResetPasswordAction.prototype.initialize = function(method, req, res, next) {
     // See if we have a reset password token.
     var hasResetToken = !!(req.tempToken && (req.tempToken.type === 'resetpass'));
     if (!hasResetToken && (method === 'create')) {
       // Figure out the username data.
-      var username = req.body ? _.property(this.settings.username)(req.body.data) : '';
+      var username = _.get(req.body.data, this.settings.username);
 
       // Make sure they have a username.
       if (!username) {
@@ -319,7 +320,7 @@ module.exports = function(router) {
     else {
       // Set the username for validation purposes.
       if (req.tempToken && req.tempToken.type === 'resetpass') {
-        req.body.data[this.settings.username] = req.tempToken.username;
+        _.set(req.body.data, this.settings.username, req.tempToken.username);
       }
 
       return next();
@@ -390,7 +391,7 @@ module.exports = function(router) {
       }
 
       // Get the password
-      var password = _.property(this.settings.password)(req.body.data);
+      var password = _.get(req.submission.data, this.settings.password);
       if (!password) {
         return next.call(this, 'No password provided.');
       }

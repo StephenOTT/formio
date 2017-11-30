@@ -4,12 +4,17 @@ var exporters = require('./index');
 var _ = require('lodash');
 var through = require('through');
 var _url = require('url');
+var debug = require('debug')('formio:error');
 
 module.exports = function(router) {
   var hook = require('../util/hook')(router.formio);
 
   // Mount the export endpoint using the url.
   router.get('/form/:formId/export', function(req, res, next) {
+    if (!_.has(req, 'token') || !_.has(req, 'token.user._id')) {
+      return res.sendStatus(400);
+    }
+
     // Get the export format.
     var format = (req.query && req.query.format)
       ? req.query.format.toLowerCase()
@@ -36,6 +41,7 @@ module.exports = function(router) {
           query = JSON.parse(req.headers['x-query']);
         }
         catch (e) {
+          debug(e);
           router.formio.util.log(e);
         }
       }
@@ -59,22 +65,29 @@ module.exports = function(router) {
               if (field && field._id) {
                 // Add url property for resource fields
                 var fieldUrl = hook.alter('fieldUrl', '/form/' + field.form + '/submission/' + field._id, form, field);
-                field.url = _url.resolve(router.formio.config.apiHost, fieldUrl);
+                var apiHost = router.formio.config.apiHost || router.formio.config.host;
+                field.url = _url.resolve(apiHost, fieldUrl);
                 // Recurse for nested resources
                 addUrl(field.data);
               }
             });
           };
 
+          // Skip this owner filter, if the user is the admin or owner.
+          if (req.skipOwnerFilter !== true && req.isAdmin !== true) {
+            // The default ownerFilter query.
+            query.owner = req.token.user._id;
+          }
+
           // Create the query stream.
           var stream = router.formio.resources.submission.model.find(query)
             .snapshot()
-            .stream()
+            .cursor({batchSize: 1000})
             .pipe(through(function(doc) {
               var row = doc.toObject({getters: true, virtuals: false});
 
               addUrl(row.data);
-              router.formio.util.removeProtectedFields(form, row);
+              router.formio.util.removeProtectedFields(form, 'export', row);
 
               this.queue(row);
             }));

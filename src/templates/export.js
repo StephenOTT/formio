@@ -1,17 +1,18 @@
 'use strict';
 
-var async = require('async');
-var _ = require('lodash');
-var util = require('../util/util');
+let async = require('async');
+let _ = require('lodash');
+let util = require('../util/util');
 
 /**
  * Perform an export of a specified template.
  *
- * @param formio
- *   The formio object.
+ * @param {Object} router
+ *   The express router object.
  */
-module.exports = function(formio) {
-  var hook = require('../util/hook')(formio);
+module.exports = (router) => {
+  let formio = router.formio;
+  let hook = require('../util/hook')(formio);
 
   // Assign the role ids.
   var assignRoles = function(_map, perms) {
@@ -122,6 +123,7 @@ module.exports = function(formio) {
             'display',
             'action',
             'tags',
+            'settings',
             'components',
             'access',
             'submissionAccess'
@@ -132,15 +134,19 @@ module.exports = function(formio) {
         // Now assign the resource components.
         _.each(forms, function(form) {
           util.eachComponent(form.components, function(component) {
-            if (
-              (component.type === 'resource') &&
-              (_map.forms && _map.forms.hasOwnProperty(component.resource))
-            ) {
-              component.resource = _map.forms[component.resource];
+            assignForm(_map, component);
+            assignForm(_map, component.data);
+            assignResource(_map, component);
+            assignResource(_map, component.data);
+            if (component && component.data && component.data.project) {
+              component.data.project = 'project';
+            }
+            if (component && component.project) {
+              component.project = 'project';
             }
 
             // Allow hooks to alter fields.
-            hook.alter('exportComponent', _export, _map, options, component);
+            hook.alter('exportComponent', component);
           });
         });
         next();
@@ -172,41 +178,57 @@ module.exports = function(formio) {
   };
 
   /**
-   * Return an easy way for someone to install a template.
+   * Export the formio template.
+   *
+   * Note: This is all of the core entities, not submission data.
    */
-  return {
-    export: function(options, next) {
-      var _export = {
-        title: options.title ? options.title : 'Export',
-        version: '2.0.0',
-        description: options.description ? options.description : '',
-        name: options.name ? options.name : 'export',
-        plan: options.plan ? options.plan : 'community',
-        roles: {},
-        forms: {},
-        actions: {},
-        resources: {}
-      };
+  let exportTemplate = (options, next) => {
+    let template = hook.alter('defaultTemplate', Object.assign({
+      title: 'Export',
+      version: '2.0.0',
+      description: '',
+      name: 'export',
+      roles: {},
+      forms: {},
+      actions: {},
+      resources: {}
+    }, _.pick(options, ['title', 'version', 'description', 'name'])), options);
 
-      // Keep track of a resource mapping.
-      var _map = {
-        roles: {},
-        forms: {}
-      };
+    // Memoize resource mapping.
+    let map = {
+      roles: {},
+      forms: {}
+    };
 
-      // Export the roles forms and actions.
-      async.series([
-        async.apply(exportRoles, _export, _map, options),
-        async.apply(exportForms, _export, _map, options),
-        async.apply(exportActions, _export, _map, options)
-      ], function(err) {
+    // Export the roles forms and actions.
+    async.series(hook.alter(`templateExportSteps`, [
+      async.apply(exportRoles, template, map, options),
+      async.apply(exportForms, template, map, options),
+      async.apply(exportActions, template, map, options)
+    ], template, map, options), (err) => {
+      if (err) {
+        return next(err);
+      }
+
+      // Send the export.
+      return next(null, template);
+    });
+  };
+
+  // Add the export endpoint
+  if (router.get) {
+    router.get('/export', (req, res, next) => {
+      let options = hook.alter('exportOptions', {}, req, res);
+      exportTemplate(options, (err, data) => {
         if (err) {
-          return next(err);
+          return next(err.message || err);
         }
 
-        // Send the export.
-        return next(null, _export);
+        res.attachment(`${options.name}-${options.version}.json`);
+        res.end(JSON.stringify(data));
       });
-    }
-  };
+    });
+  }
+
+  return exportTemplate;
 };

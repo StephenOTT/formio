@@ -1,56 +1,53 @@
-/* eslint-env mocha */
 'use strict';
 
-var express = require('express');
-var request = require('supertest');
-var mongoose = require('mongoose');
-var events = require('events');
-var _ = require('lodash');
-var Q = require('q');
-var hooks = require('./hooks');
+let assert = require('assert');
+let formioUtils = require('formiojs/utils');
+let _ = require('lodash');
+var comparison = null;
 
-module.exports = function(app, server, settings, mount, config) {
-  // Track the status of the initial test bootstrap.
-  var bootstrap = Q.defer();
+module.exports = (app, template, hook) => {
+  describe('Bootstrap test data', function() {
+    it('Should remove old test data', function(done) {
+      template.clearData(done);
+    });
 
-  // Use the given express app or default;
-  app = app || express();
+    it('Should be able to bootstrap the default template', function(done) {
+      comparison = _.cloneDeep(template);
 
-  // Use the given router or default to the formio server.
-  config = config || require('./config.json');
-  var formioServer = server || require('../index')(config);
+      app.formio.template.import.template(template, function(err) {
+        if (err) {
+          return done(err);
+        }
 
-  // Set the settings.
-  settings = _.merge(settings, hooks) || hooks;
+        var resourceA = template.resources.a;
+        var resourceB = template.resources.b;
+        var resourceComponentA = formioUtils.getComponent(resourceB.components, 'a');
+        var resourceComponentB = formioUtils.getComponent(resourceA.components, 'b');
+        assert.equal(resourceA._id, resourceComponentA.resource, `Resource B's resource component for A should have the correct resource id. (Got ${resourceComponentA.resource}, expected ${resourceA._id})`);
+        assert.equal(resourceB._id, resourceComponentB.resource, `Resource A's resource component for B should have the correct resource id. (Got ${resourceComponentB.resource}, expected ${resourceB._id})`);
+        done();
+      });
+    });
 
-  // The default project template.
-  var template = require('./template')();
-  template.hooks = settings;
+    it('Should be able to export what was imported', function(done) {
+      app.formio.template.export({
+        title: template.title,
+        description: template.description,
+        name: template.name
+      }, function(err, _export) {
+        if (err) {
+          return done(err);
+        }
 
-  // Establish the helper library.
-  template.Helper = require('./helper')(app, template);
-
-  // Initialize the formio router.
-  formioServer.init(settings).then(function(_formio) {
-    // Allow tests access to formio.
-    app.formio = _formio;
-
-    // Expose server internals.
-    app._server = formioServer;
-
-    // Use the formio router and optional mounting point.
-    if (mount) {
-      app.use(mount, formioServer);
-    } else {
-      app.use(formioServer);
-    }
-
-    // Say we are ready.
-    bootstrap.resolve({
-      app: app,
-      template: template
+        assert.equal(_export.title, comparison.title);
+        assert.equal(_export.description, comparison.description);
+        assert.equal(_export.name, comparison.name);
+        assert.deepEqual(_export.roles, comparison.roles);
+        assert.deepEqual(_export.forms, comparison.forms);
+        assert.deepEqual(_export.resources, comparison.resources);
+        assert.equal(_export.actions.length, comparison.actions.length);
+        done();
+      });
     });
   });
-
-  return bootstrap.promise;
 };

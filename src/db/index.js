@@ -5,7 +5,11 @@ var MongoClient = require('mongodb').MongoClient;
 var semver = require('semver');
 var _ = require('lodash');
 var fs = require('fs');
-var debug = require('debug')('formio:db');
+var debug = {
+  db: require('debug')('formio:db'),
+  error: require('debug')('formio:error'),
+  sanity: require('debug')('formio:sanityCheck')
+};
 var path = require('path');
 
 // The mongo database connection.
@@ -83,7 +87,7 @@ module.exports = function(formio) {
         }
 
         currentLock = result.value;
-        debug('Lock unlocked');
+        debug.db('Lock unlocked');
         next();
       }
     );
@@ -100,6 +104,7 @@ module.exports = function(formio) {
   var connection = function(next) {
     // If a connection exists, skip the initialization.
     if (db) {
+      debug.db('Connection exists');
       return next();
     }
 
@@ -108,17 +113,22 @@ module.exports = function(formio) {
       ? config.mongo
       : config.mongo[0];
 
+    debug.db('Opening new connection to ' + dbUrl);
+
     // Establish a connection and continue with execution.
-    MongoClient.connect(dbUrl, function(err, connection) {
+    MongoClient.connect(dbUrl, {connectTimeoutMS: 300000, socketTimeoutMS: 300000}, function(err, connection) {
       if (err) {
-        debug('Connection Error: ' + err);
+        debug.db('Connection Error: ' + err);
         unlock(function() {
           throw new Error('Could not connect to the given Database for server updates: ' + dbUrl + '.');
         });
       }
       db = connection;
 
+      debug.db('Connection successful');
+
       db.collection('schema', function(err, collection) {
+        debug.db('Schema collection opened');
         if (err) {
           return next(err);
         }
@@ -139,7 +149,7 @@ module.exports = function(formio) {
   var checkInstall = function(next) {
     formio.util.log('Checking for db install.');
     db.listCollections().toArray().then(function(collections) {
-      debug('Collections found: ' + collections.length);
+      debug.db('Collections found: ' + collections.length);
       // 3 is an arbitrary length. We just want a general idea that things have been installed.
       if (collections.length < 3) {
         formio.util.log(' > No install found. Starting new install.');
@@ -177,6 +187,7 @@ module.exports = function(formio) {
             }
           }
           catch (err) {
+            debug.error(err);
             formio.util.log(' > Unable to use old db secret key.');
           }
         }
@@ -205,6 +216,7 @@ module.exports = function(formio) {
 
     // Skip functionality if testing.
     if (process.env.TEST_SUITE) {
+      debug.db('Skipping for TEST_SUITE');
       return response
         ? res.sendStatus(200)
         : next();
@@ -232,16 +244,19 @@ module.exports = function(formio) {
     connection(function() {
       // Skip update if request was a get and update was less than 10 seconds ago (in ms).
       if (req.method === 'GET') {
+        debug.sanity('Checking GET');
         now = (new Date()).getTime();
 
         // Do a full sanity check when expecting a response.
         if (response) {
           if ((cache.full.last + 10000) > now) {
+            debug.sanity('Response and Less than 10 seconds');
             return cache.full.isValid
               ? handleResponse()
               : handleResponse(cache.full.error);
           }
           else {
+            debug.sanity('Response and More than 10 seconds');
             // Update the last check time.
             cache.full.last = now;
           }
@@ -249,17 +264,20 @@ module.exports = function(formio) {
         // Do a partial sanity check when expecting a response.
         else {
           if ((cache.partial.last + 10000) > now) {
+            debug.sanity('No Response and Less than 10 seconds');
             return cache.partial.isValid
               ? handleResponse()
               : handleResponse(cache.partial.error);
           }
           else {
+            debug.sanity('No Response and More than 10 seconds');
             // Update the last check time.
             cache.partial.last = now;
           }
         }
       }
 
+      debug.sanity('Checking formio schema');
       // A cached response was not viable here, query and update the cache.
       schema.findOne({key: 'formio'}, function(err, document) {
         if (err || !document) {
@@ -268,6 +286,7 @@ module.exports = function(formio) {
 
           throw new Error('The formio lock was not found..');
         }
+        debug.sanity('Schema found');
 
         // When sending a response, a direct query was performed, check for different versions.
         if (response) {
@@ -276,6 +295,7 @@ module.exports = function(formio) {
             ? false
             : true;
 
+          debug.sanity('Has Response is valid: ' + cache.full.isValid);
           return cache.full.isValid
             ? handleResponse()
             : handleResponse(cache.full.error);
@@ -285,6 +305,7 @@ module.exports = function(formio) {
           // Update the valid cache for following GET requests.
           cache.partial.isValid = semver.major(document.version) === semver.major(config.schema);
 
+          debug.sanity('Has Partial Response is valid: ' + cache.partial.isValid);
           return cache.partial.isValid
             ? handleResponse()
             : handleResponse(cache.partial.error);
@@ -306,7 +327,7 @@ module.exports = function(formio) {
       }
 
       files = files.map(function(name) {
-        debug('Update found: ' + name);
+        debug.db('Update found: ' + name);
         return name.split('.js')[0];
       });
 
@@ -317,7 +338,7 @@ module.exports = function(formio) {
         }
 
         updates = files.sort(semver.compare);
-        debug('Final updates');
+        debug.db('Final updates');
         next();
       });
     });
@@ -343,14 +364,18 @@ module.exports = function(formio) {
       // Engage the lock.
       else if (!document || document.length === 0) {
         // Create a new lock, because one was not present.
-        debug('Creating a lock, because one was not found.');
-        schema.insertOne({key: 'formio', isLocked: (new Date()).getTime(), version: '0.0.0'}, function(err, document) {
+        debug.db('Creating a lock, because one was not found.');
+        schema.insertOne({
+          key: 'formio',
+          isLocked: (new Date()).getTime(),
+          version: config.schema
+        }, function(err, document) {
           if (err) {
             return next(err);
           }
 
           currentLock = document.ops[0];
-          debug('Created a new lock');
+          debug.db('Created a new lock');
           next();
         });
       }
@@ -358,7 +383,7 @@ module.exports = function(formio) {
         return next('More than one lock was found, terminating updates.');
       }
       else {
-        debug(document);
+        debug.db(document);
         currentLock = document[0];
 
         if (currentLock.isLocked) {
@@ -376,7 +401,7 @@ module.exports = function(formio) {
               }
 
               currentLock = result.value;
-              debug('Lock engaged');
+              debug.db('Lock engaged');
               next();
             }
           );
@@ -410,10 +435,13 @@ module.exports = function(formio) {
 
     // Versions are the same, skip updates.
     if (semver.eq(code, database)) {
-      debug('Current database (' + database + ') and Pending code sversions (' + code + ') are the same.');
+      debug.db('Current database (' + database + ') and Pending code sversions (' + code + ') are the same.');
       return false;
     }
-    else if (semver.gt(database, code)) {
+    else if (
+      semver.gt(database, code) &&
+      (['patch', 'prepatch', 'prerelease', 'minor'].indexOf(semver.diff(database, code)) === -1)
+    ) {
       unlock(function() {
         throw new Error(
           'The provided codebase version is more recent than the database schema version. Update the codebase and ' +
@@ -456,7 +484,7 @@ module.exports = function(formio) {
     });
 
     // Only take action if outstanding updates exist.
-    debug('Pending updates');
+    debug.db('Pending updates');
     if (pending.length > 0) {
       async.eachSeries(pending, function(pending, callback) {
         formio.util.log(' > Starting schema update to ' + pending);
@@ -464,20 +492,39 @@ module.exports = function(formio) {
         // Load the update then update the schema lock version.
         var _update = null;
 
-        // Attempt to load the the pending update, allow anyone to hook the pending updates location.
+        // Attempt to load the the pending update.
+        // Allow anyone to hook the pending updates location.
         try {
-          _update = require(__dirname + '/updates/' + pending);
+          _update = formio.hook.alter('updateLocation', pending);
         }
         catch (e) {
-          _update = formio.hook.alter('updateLocation', pending);
+          debug.error(e);
+          debug.db(e);
+        }
+
+        // No private update was found, check the public location.
+        debug.db('_update:');
+        debug.db(_update);
+        if (typeof _update !== 'function') {
+          try {
+            _update = require(__dirname + '/updates/' + pending);
+          }
+          catch (e) {
+            debug.error(e);
+            debug.db(e);
+          }
         }
 
         // Attempt to resolve the update.
         try {
-          if (!_update) {
+          if (typeof _update !== 'function') {
             return callback('Could not resolve the path for update: ' + pending);
           }
 
+          debug.db('Update Params:');
+          debug.db(db);
+          debug.db(config);
+          debug.db(tools);
           _update(db, config, tools, function(err) {
             if (err) {
               return callback(err);
@@ -487,11 +534,12 @@ module.exports = function(formio) {
           });
         }
         catch (e) {
+          debug.error(e);
           return callback(e);
         }
       }, function(err) {
         if (err) {
-          debug(err);
+          debug.db(err);
           return next(err);
         }
 
@@ -513,17 +561,16 @@ module.exports = function(formio) {
    */
   var initialize = function(next) {
     if (process.env.TEST_SUITE) {
-      async.series([
-        connection
-      ], function(err) {
+      return connection(function(err) {
         if (err) {
-          debug(err);
+          debug.db(err);
           return next(err);
         }
 
-        return next(null, db);
+        next(null, db);
       });
     }
+
     async.series([
       connection,
       checkInstall,
@@ -535,7 +582,7 @@ module.exports = function(formio) {
     ], function(err) {
       unlock(function() {
         if (err) {
-          debug(err);
+          debug.db(err);
           return next(err);
         }
 

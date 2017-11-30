@@ -1,39 +1,44 @@
-var _ = require('lodash');
-var emails = [];
-var emailCallback = null;
-var emailExpects = 0;
-var emailCounter = 0;
-var Emailer = {
-  reset: function() {
-    emailCounter = 0;
+'use strict';
+
+let _ = require('lodash');
+let emails = [];
+let events = null;
+let Emailer = {
+  addEmitter: (eventEmitter) => {
+    this.events = eventEmitter;
+  },
+  getEmitter: () => this.events,
+  reset: () => {
     emails = [];
-    emailCallback = null;
-    emailExpects = 0;
   },
-  onEmails: function(expects, cb) {
-    Emailer.reset();
-    emailExpects = expects;
-    emailCallback = cb;
-  },
-  getLastEmail: function() {
-    var email = _.clone(emails[(emails.length - 1)]);
+  getLastEmail: () => {
+    let email = _.cloneDeep(emails.pop()) || {};
     Emailer.reset();
     return email;
   },
-  getEmails: function() {
-    var _emails = _.clone(emails);
+  getEmails: () => {
+    let _emails = _.cloneDeep(emails) || [];
     Emailer.reset();
     return _emails;
   },
-  on: {
-    email: function(transport, mail) {
+  on: {},
+  alter: {
+    emailSend: (send, mail, cb) => {
+      // Only cache 10 emails.
       if (emails.length > 9) {
         emails.shift();
       }
       emails.push(mail);
-      if (emailCallback && (++emailCounter >= emailExpects)) {
-        emailCallback(Emailer.getEmails());
+
+      // If events are enabled
+      if (this.events) {
+        this.events.emit('newMail', mail);
       }
+      else {
+        console.error(`No event emitter is available`);
+      }
+
+      return cb(null, false);
     }
   }
 };

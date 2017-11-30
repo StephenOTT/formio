@@ -5,8 +5,12 @@ var request = require('supertest');
 var assert = require('assert');
 var _ = require('lodash');
 var async = require('async');
+var docker = process.env.DOCKER;
+var chance = new (require('chance'))();
 
 module.exports = function(app, template, hook) {
+  var Helper = require('./helper')(app);
+  
   describe('Roles', function() {
     // Store the temp role for this test suite.
     var tempRole = {
@@ -255,6 +259,27 @@ module.exports = function(app, template, hook) {
             done();
           });
       });
+
+      it('The default Admin Role for a Project cannot be deleted', function(done) {
+        request(app)
+          .delete(hook.alter('url', '/role/' + template.roles.administrator._id, template))
+          .set('x-jwt-token', template.users.admin.token)
+          .expect('Content-Type', /text\/plain/)
+          .expect(405)
+          .end(function(err, res) {
+            if (err) {
+              return done(err);
+            }
+
+            var response = res.text;
+            assert.equal(response, 'Method Not Allowed');
+
+            // Store the JWT for future API calls.
+            template.users.admin.token = res.headers['x-jwt-token'];
+
+            done();
+          });
+      });
     });
 
     describe('Role Normalization', function() {
@@ -278,10 +303,10 @@ module.exports = function(app, template, hook) {
           });
       });
 
+      if (!docker)
       it('Deleted roles should remain in the DB', function(done) {
-        if (!app.formio) return done();
-
-        app.formio.resources.role.model.findOne({_id: template.roles.tempRole._id}, function(err, role) {
+        var formio = hook.alter('formio', app.formio);
+        formio.resources.role.model.findOne({_id: template.roles.tempRole._id}, function(err, role) {
           if (err) {
             return done(err);
           }
@@ -582,6 +607,57 @@ module.exports = function(app, template, hook) {
             done();
           });
         });
+      });
+    });
+
+    describe('Role MachineNames', function() {
+      var _role;
+      var name = chance.word();
+      var helper;
+
+      before(function() {
+        helper = new Helper(template.users.admin, template);
+      });
+
+      after(function(done) {
+        helper.deleteRole(name, done);
+      });
+
+      it('Roles expose their machineNames through the api', function(done) {
+        helper
+          .role({
+            title: name
+          })
+          .execute(function(err, result) {
+            if (err) {
+              return done(err);
+            }
+
+            var role = result.getRole(name);
+            assert(role.hasOwnProperty('machineName'));
+            _role = role;
+            done();
+          });
+      });
+
+      it('A user can modify their role machineNames', function(done) {
+        var newMachineName = chance.word();
+
+        helper
+          .role(name, {
+            _id: _role._id,
+            machineName: newMachineName
+          })
+          .execute(function(err, result) {
+            if (err) {
+              return done(err);
+            }
+
+            var role = result.getRole(name);
+            assert(role.hasOwnProperty('machineName'));
+            assert.equal(role.machineName, newMachineName);
+            done();
+          });
       });
     });
   });

@@ -14,13 +14,13 @@ module.exports = function(router) {
   ];
   handlers.after = [
     router.formio.middleware.bootstrapNewRoleAccess,
-    router.formio.middleware.filterResourcejsResponse(['deleted', '__v', 'machineName'])
+    router.formio.middleware.filterResourcejsResponse(['deleted', '__v'])
   ];
 
   return Resource(
     router,
     '',
     'role',
-    mongoose.model('role', router.formio.schemas.role)
+    mongoose.model('role')
   ).rest(hook.alter('roleRoutes', handlers));
 };
